@@ -19,24 +19,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install OS deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Install OS deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
       - name: Create venv
-        shell: bash
         run: |
           python -m venv .venv
           source .venv/bin/activate
           python -m pip install -U pip
 
-      - name: Get Private PyPI URL (debug)
+      - name: Get Private PyPI URL
         id: pypi
         shell: bash
         run: |
@@ -51,44 +50,18 @@ jobs:
           API_ENDPOINT="${MODEL_SECURITY_API_ENDPOINT:-https://api.sase.paloaltonetworks.com/aims}"
           TOKEN_ENDPOINT="${MODEL_SECURITY_TOKEN_ENDPOINT:-https://auth.apps.paloaltonetworks.com/oauth2/access_token}"
 
-          echo "Token endpoint: $TOKEN_ENDPOINT"
-          echo "API endpoint:   $API_ENDPOINT"
-
-          TOKEN_RESPONSE=$(curl -sS -X POST "$TOKEN_ENDPOINT" \
+          TOKEN_RESPONSE=$(curl -sf -X POST "$TOKEN_ENDPOINT" \
             -H "Content-Type: application/x-www-form-urlencoded" \
             -u "$MODEL_SECURITY_CLIENT_ID:$MODEL_SECURITY_CLIENT_SECRET" \
             -d "grant_type=client_credentials&scope=tsg_id:$TSG_ID")
 
-          SCM_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
-          if [ -z "$SCM_TOKEN" ]; then
-            echo "Failed to get access_token. Full response:"
-            echo "$TOKEN_RESPONSE"
-            exit 1
-          fi
-          echo "Got access token (masked)."
-
-          HTTP_CODE=$(curl -sS -o pypi_resp.json -w "%{http_code}" \
-            -X GET "$API_ENDPOINT/mgmt/v1/pypi/authenticate" \
+          SCM_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+          PYPI_RESPONSE=$(curl -sf -X GET "$API_ENDPOINT/mgmt/v1/pypi/authenticate" \
             -H "Authorization: Bearer $SCM_TOKEN")
-
-          echo "pypi/authenticate http_code=$HTTP_CODE"
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "Response body:"
-            cat pypi_resp.json
-            exit 1
-          fi
-
-          PYPI_URL=$(jq -r '.url // empty' < pypi_resp.json)
-          if [ -z "$PYPI_URL" ]; then
-            echo "No .url in response:"
-            cat pypi_resp.json
-            exit 1
-          fi
+          PYPI_URL=$(echo "$PYPI_RESPONSE" | jq -r '.url')
 
           echo "$PYPI_URL"
           EOF
-
           chmod +x get_pypi_url.sh
           PYPI_URL="$(./get_pypi_url.sh)"
           echo "pypi_url=$PYPI_URL" >> "$GITHUB_OUTPUT"
@@ -105,4 +78,36 @@ jobs:
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          model-security scan --security-group-uuid "$SECURITY_GROUP_UUID" --model-uri "$MODEL_URI"
+
+          echo "Scanning model: $MODEL_URI"
+          set +e
+          OUT=$(model-security scan --security-group-uuid "$SECURITY_GROUP_UUID" --model-uri "$MODEL_URI" 2>&1)
+          RC=$?
+          set -e
+
+          echo "$OUT"
+
+          # 出力から UUID を拾って詳細JSONを保存（失敗時の調査用）
+          SCAN_ID=$(echo "$OUT" | grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -n 1 || true)
+          if [ -n "$SCAN_ID" ]; then
+            echo "Scan ID: $SCAN_ID"
+            model-security get-scan "$SCAN_ID" > scan_result.json
+          else
+            echo "No scan id found in output."
+          fi
+
+          # BLOCKED / 失敗ならここでジョブを落とす（＝デプロイ不可）
+          if [ $RC -ne 0 ]; then
+            echo "Model scan blocked or failed (exit=$RC)."
+            exit 1
+          fi
+
+          echo "Model scan passed."
+
+      - name: Upload scan result (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-scan-result
+          path: scan_result.json
+          if-no-files-found: ignore
