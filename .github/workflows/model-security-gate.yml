@@ -1,56 +1,108 @@
-- name: Get Private PyPI URL (debug)
-  id: pypi
-  shell: bash
-  run: |
-    cat > get_pypi_url.sh << 'EOF'
-    #!/usr/bin/env bash
-    set -euo pipefail
+name: Model Security Gate
 
-    : "${MODEL_SECURITY_CLIENT_ID:?not set}"
-    : "${MODEL_SECURITY_CLIENT_SECRET:?not set}"
-    : "${TSG_ID:?not set}"
+on:
+  workflow_dispatch:
+  pull_request:
 
-    API_ENDPOINT="${MODEL_SECURITY_API_ENDPOINT:-https://api.sase.paloaltonetworks.com/aims}"
-    TOKEN_ENDPOINT="${MODEL_SECURITY_TOKEN_ENDPOINT:-https://auth.apps.paloaltonetworks.com/oauth2/access_token}"
+jobs:
+  scan:
+    runs-on: ubuntu-latest
 
-    echo "Token endpoint: $TOKEN_ENDPOINT"
-    echo "API endpoint:   $API_ENDPOINT"
+    env:
+      MODEL_SECURITY_CLIENT_ID: ${{ secrets.MODEL_SECURITY_CLIENT_ID }}
+      MODEL_SECURITY_CLIENT_SECRET: ${{ secrets.MODEL_SECURITY_CLIENT_SECRET }}
+      TSG_ID: ${{ secrets.TSG_ID }}
+      MODEL_SECURITY_API_ENDPOINT: ${{ vars.MODEL_SECURITY_API_ENDPOINT }}
+      SECURITY_GROUP_UUID: ${{ vars.MODEL_SECURITY_GROUP_UUID }}
+      MODEL_URI: ${{ vars.MODEL_URI }}
 
-    TOKEN_RESPONSE=$(curl -sS -X POST "$TOKEN_ENDPOINT" \
-      -H "Content-Type: application/x-www-form-urlencoded" \
-      -u "$MODEL_SECURITY_CLIENT_ID:$MODEL_SECURITY_CLIENT_SECRET" \
-      -d "grant_type=client_credentials&scope=tsg_id:$TSG_ID")
+    steps:
+      - uses: actions/checkout@v4
 
-    SCM_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
-    if [ -z "$SCM_TOKEN" ]; then
-      echo "Failed to get access_token. Full response:"
-      echo "$TOKEN_RESPONSE"
-      exit 1
-    fi
-    echo "Got access token (masked)."
+      - name: Install OS deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
 
-    HTTP_CODE=$(curl -sS -o pypi_resp.json -w "%{http_code}" \
-      -X GET "$API_ENDPOINT/mgmt/v1/pypi/authenticate" \
-      -H "Authorization: Bearer $SCM_TOKEN")
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    echo "pypi/authenticate http_code=$HTTP_CODE"
+      - name: Create venv
+        shell: bash
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install -U pip
 
-    if [ "$HTTP_CODE" != "200" ]; then
-      echo "Response body:"
-      cat pypi_resp.json
-      exit 1
-    fi
+      - name: Get Private PyPI URL (debug)
+        id: pypi
+        shell: bash
+        run: |
+          cat > get_pypi_url.sh << 'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
 
-    PYPI_URL=$(jq -r '.url // empty' < pypi_resp.json)
-    if [ -z "$PYPI_URL" ]; then
-      echo "No .url in response:"
-      cat pypi_resp.json
-      exit 1
-    fi
+          : "${MODEL_SECURITY_CLIENT_ID:?not set}"
+          : "${MODEL_SECURITY_CLIENT_SECRET:?not set}"
+          : "${TSG_ID:?not set}"
 
-    echo "$PYPI_URL"
-    EOF
+          API_ENDPOINT="${MODEL_SECURITY_API_ENDPOINT:-https://api.sase.paloaltonetworks.com/aims}"
+          TOKEN_ENDPOINT="${MODEL_SECURITY_TOKEN_ENDPOINT:-https://auth.apps.paloaltonetworks.com/oauth2/access_token}"
 
-    chmod +x get_pypi_url.sh
-    PYPI_URL="$(./get_pypi_url.sh)"
-    echo "pypi_url=$PYPI_URL" >> "$GITHUB_OUTPUT"
+          echo "Token endpoint: $TOKEN_ENDPOINT"
+          echo "API endpoint:   $API_ENDPOINT"
+
+          TOKEN_RESPONSE=$(curl -sS -X POST "$TOKEN_ENDPOINT" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -u "$MODEL_SECURITY_CLIENT_ID:$MODEL_SECURITY_CLIENT_SECRET" \
+            -d "grant_type=client_credentials&scope=tsg_id:$TSG_ID")
+
+          SCM_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
+          if [ -z "$SCM_TOKEN" ]; then
+            echo "Failed to get access_token. Full response:"
+            echo "$TOKEN_RESPONSE"
+            exit 1
+          fi
+          echo "Got access token (masked)."
+
+          HTTP_CODE=$(curl -sS -o pypi_resp.json -w "%{http_code}" \
+            -X GET "$API_ENDPOINT/mgmt/v1/pypi/authenticate" \
+            -H "Authorization: Bearer $SCM_TOKEN")
+
+          echo "pypi/authenticate http_code=$HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Response body:"
+            cat pypi_resp.json
+            exit 1
+          fi
+
+          PYPI_URL=$(jq -r '.url // empty' < pypi_resp.json)
+          if [ -z "$PYPI_URL" ]; then
+            echo "No .url in response:"
+            cat pypi_resp.json
+            exit 1
+          fi
+
+          echo "$PYPI_URL"
+          EOF
+
+          chmod +x get_pypi_url.sh
+          PYPI_URL="$(./get_pypi_url.sh)"
+          echo "pypi_url=$PYPI_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Install model-security-client
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          pip install model-security-client --extra-index-url "${{ steps.pypi.outputs.pypi_url }}"
+          model-security --help > /dev/null
+
+      - name: Run scan (gate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          model-security scan --security-group-uuid "$SECURITY_GROUP_UUID" --model-uri "$MODEL_URI"
