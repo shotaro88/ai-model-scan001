@@ -1,113 +1,56 @@
-name: Model Security Gate
+- name: Get Private PyPI URL (debug)
+  id: pypi
+  shell: bash
+  run: |
+    cat > get_pypi_url.sh << 'EOF'
+    #!/usr/bin/env bash
+    set -euo pipefail
 
-on:
-  workflow_dispatch:
-  pull_request:
+    : "${MODEL_SECURITY_CLIENT_ID:?not set}"
+    : "${MODEL_SECURITY_CLIENT_SECRET:?not set}"
+    : "${TSG_ID:?not set}"
 
-jobs:
-  scan:
-    runs-on: ubuntu-latest
+    API_ENDPOINT="${MODEL_SECURITY_API_ENDPOINT:-https://api.sase.paloaltonetworks.com/aims}"
+    TOKEN_ENDPOINT="${MODEL_SECURITY_TOKEN_ENDPOINT:-https://auth.apps.paloaltonetworks.com/oauth2/access_token}"
 
-    env:
-      MODEL_SECURITY_CLIENT_ID: ${{ secrets.MODEL_SECURITY_CLIENT_ID }}
-      MODEL_SECURITY_CLIENT_SECRET: ${{ secrets.MODEL_SECURITY_CLIENT_SECRET }}
-      TSG_ID: ${{ secrets.TSG_ID }}
-      MODEL_SECURITY_API_ENDPOINT: ${{ vars.MODEL_SECURITY_API_ENDPOINT }}
-      SECURITY_GROUP_UUID: ${{ vars.MODEL_SECURITY_GROUP_UUID }}
-      MODEL_URI: ${{ vars.MODEL_URI }}
+    echo "Token endpoint: $TOKEN_ENDPOINT"
+    echo "API endpoint:   $API_ENDPOINT"
 
-    steps:
-      - uses: actions/checkout@v4
+    TOKEN_RESPONSE=$(curl -sS -X POST "$TOKEN_ENDPOINT" \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      -u "$MODEL_SECURITY_CLIENT_ID:$MODEL_SECURITY_CLIENT_SECRET" \
+      -d "grant_type=client_credentials&scope=tsg_id:$TSG_ID")
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+    SCM_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
+    if [ -z "$SCM_TOKEN" ]; then
+      echo "Failed to get access_token. Full response:"
+      echo "$TOKEN_RESPONSE"
+      exit 1
+    fi
+    echo "Got access token (masked)."
 
-      - name: Install OS deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl
+    HTTP_CODE=$(curl -sS -o pypi_resp.json -w "%{http_code}" \
+      -X GET "$API_ENDPOINT/mgmt/v1/pypi/authenticate" \
+      -H "Authorization: Bearer $SCM_TOKEN")
 
-      - name: Create venv
-        run: |
-          python -m venv .venv
-          source .venv/bin/activate
-          python -m pip install -U pip
+    echo "pypi/authenticate http_code=$HTTP_CODE"
 
-      - name: Get Private PyPI URL
-        id: pypi
-        shell: bash
-        run: |
-          cat > get_pypi_url.sh << 'EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
+    if [ "$HTTP_CODE" != "200" ]; then
+      echo "Response body:"
+      cat pypi_resp.json
+      exit 1
+    fi
 
-          : "${MODEL_SECURITY_CLIENT_ID:?not set}"
-          : "${MODEL_SECURITY_CLIENT_SECRET:?not set}"
-          : "${TSG_ID:?not set}"
+    PYPI_URL=$(jq -r '.url // empty' < pypi_resp.json)
+    if [ -z "$PYPI_URL" ]; then
+      echo "No .url in response:"
+      cat pypi_resp.json
+      exit 1
+    fi
 
-          API_ENDPOINT="${MODEL_SECURITY_API_ENDPOINT:-https://api.sase.paloaltonetworks.com/aims}"
-          TOKEN_ENDPOINT="${MODEL_SECURITY_TOKEN_ENDPOINT:-https://auth.apps.paloaltonetworks.com/oauth2/access_token}"
+    echo "$PYPI_URL"
+    EOF
 
-          TOKEN_RESPONSE=$(curl -sf -X POST "$TOKEN_ENDPOINT" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -u "$MODEL_SECURITY_CLIENT_ID:$MODEL_SECURITY_CLIENT_SECRET" \
-            -d "grant_type=client_credentials&scope=tsg_id:$TSG_ID")
-
-          SCM_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
-          PYPI_RESPONSE=$(curl -sf -X GET "$API_ENDPOINT/mgmt/v1/pypi/authenticate" \
-            -H "Authorization: Bearer $SCM_TOKEN")
-          PYPI_URL=$(echo "$PYPI_RESPONSE" | jq -r '.url')
-
-          echo "$PYPI_URL"
-          EOF
-          chmod +x get_pypi_url.sh
-          PYPI_URL="$(./get_pypi_url.sh)"
-          echo "pypi_url=$PYPI_URL" >> "$GITHUB_OUTPUT"
-
-      - name: Install model-security-client
-        shell: bash
-        run: |
-          source .venv/bin/activate
-          pip install model-security-client --extra-index-url "${{ steps.pypi.outputs.pypi_url }}"
-          model-security --help > /dev/null
-
-      - name: Run scan (gate)
-        shell: bash
-        run: |
-          set -euo pipefail
-          source .venv/bin/activate
-
-          echo "Scanning model: $MODEL_URI"
-          set +e
-          OUT=$(model-security scan --security-group-uuid "$SECURITY_GROUP_UUID" --model-uri "$MODEL_URI" 2>&1)
-          RC=$?
-          set -e
-
-          echo "$OUT"
-
-          # 出力から UUID を拾って詳細JSONを保存（失敗時の調査用）
-          SCAN_ID=$(echo "$OUT" | grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -n 1 || true)
-          if [ -n "$SCAN_ID" ]; then
-            echo "Scan ID: $SCAN_ID"
-            model-security get-scan "$SCAN_ID" > scan_result.json
-          else
-            echo "No scan id found in output."
-          fi
-
-          # BLOCKED / 失敗ならここでジョブを落とす（＝デプロイ不可）
-          if [ $RC -ne 0 ]; then
-            echo "Model scan blocked or failed (exit=$RC)."
-            exit 1
-          fi
-
-          echo "Model scan passed."
-
-      - name: Upload scan result (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: model-scan-result
-          path: scan_result.json
-          if-no-files-found: ignore
+    chmod +x get_pypi_url.sh
+    PYPI_URL="$(./get_pypi_url.sh)"
+    echo "pypi_url=$PYPI_URL" >> "$GITHUB_OUTPUT"
